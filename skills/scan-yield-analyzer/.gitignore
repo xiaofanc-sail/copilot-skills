@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.csv
+*.json
+*.html
+*.gz
+*.ITF
+*.itf
+*.bdefs
+*.mtpl
+*.log
+data/
+reports/
