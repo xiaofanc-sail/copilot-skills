@@ -23,6 +23,7 @@ def read_devices(path):
             line = raw.rstrip('\r\n')
             if device is not None and line.startswith('2_tname_testtime_SCN_'):
                 device['scan_execution_records'].add(line[len('2_tname_testtime_'):])
+                device['scan_execution_order'].append(line[len('2_tname_testtime_'):])
                 continue
             if not line.startswith(('3_', '4_wafid_', '6_lotid_', '6_prgnm_', '5_lcode_')):
                 continue
@@ -35,7 +36,7 @@ def read_devices(path):
                 if device is not None:
                     device['scan_execution_records'] = sorted(device['scan_execution_records'])
                     yield device
-                device = {**header, 'scan_execution_records': set()} if line == '3_lsep' else None
+                device = {**header, 'scan_execution_records': set(), 'scan_execution_order': []} if line == '3_lsep' else None
             elif device is not None:
                 if tag in {'3_tfail', '3_tpass'}:
                     require(re.fullmatch(r'\{(?:\d+(?:\s*,\s*\d+)*)?\}', value),
@@ -167,11 +168,36 @@ def load_tp(tp_root):
     return definitions, counter_map, leaf_bins
 
 
+def first_scan_failures(die, failed):
+    order = die.get('scan_execution_order')
+    calls = collections.defaultdict(list)
+    observed = collections.defaultdict(set)
+    failures = collections.defaultdict(set)
+    for name in order or []:
+        if not excluded(name):
+            calls[name.split('::', 1)[0]].append(name)
+    for name in set(die['scan_execution_records']) | failed.keys():
+        if not excluded(name):
+            module = name.split('::', 1)[0]
+            observed[module].add(name)
+            if name in failed:
+                failures[module].add(name)
+    first, uncertain = set(), set()
+    for module, names in observed.items():
+        counts = collections.Counter(calls[module])
+        if order is None or set(counts) != names or any(counts[name] != 1 for name in failures[module]):
+            uncertain.add(module)
+            continue
+        first.update(next(({name} for name in calls[module] if name in failures[module]), set()))
+    return first, uncertain
+
+
 def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42')):
     definitions, counter_map, leaf_bins = load_tp(tp_root)
     scan_names = {name for name, item in definitions.items() if item['module'].startswith('SCN_')}
     states = collections.defaultdict(lambda: {'timed': set(), 'observed': set(), 'failed': set(),
-                                             'killed': set(), 'final_pass': set(), 'both': set(), 'counters': set()})
+                                             'killed': set(), 'final_pass': set(), 'both': set(), 'counters': set(),
+                                             'first_failed': set(), 'uncertain_order': set()})
     evidence = []
     for index, die in enumerate(dies):
         timed = set(die['scan_execution_records'])
@@ -186,6 +212,7 @@ def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42'))
             name = counter_map.get(counter)
             if name in scan_names:
                 passed.add(name)
+        first_failed, uncertain_modules = first_scan_failures(die, failed)
         primary = counter_map.get(die['3_binn'])
         if die['3_curibin'] in scan_bins:
             require(primary in failed, f'Scan IB has no matching final DB fail counter: {die["3_binn"]}')
@@ -196,6 +223,10 @@ def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42'))
         for name in timed | failed.keys() | passed:
             state = states[name]
             state['observed'].add(index)
+            if name in first_failed:
+                state['first_failed'].add(index)
+            if name.split('::', 1)[0] in uncertain_modules:
+                state['uncertain_order'].add(index)
             if name in timed:
                 state['timed'].add(index)
             if name in failed:
@@ -210,7 +241,8 @@ def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42'))
         evidence.append({'lot': die['6_lotid'], 'wafer': die['4_wafid'], 'x': die['3_wafxloc'],
                          'y': die['3_wafyloc'], 'final_fb': die['3_curfbin'], 'final_db': die['3_binn'],
                          'final_ib': die['3_curibin'], 'final_result': die['3_trslt'], 'primary_test': primary,
-                         'fail_counters': die.get('3_tfail', [])})
+                         'fail_counters': die.get('3_tfail', []),
+                         'scan_execution_order': die.get('scan_execution_order')})
     rows = []
     for name in sorted(scan_names):
         definition = definitions[name]
@@ -236,6 +268,7 @@ def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42'))
         timed, observed, failed, killed = (state[key] for key in ('timed', 'observed', 'failed', 'killed'))
         require(killed <= failed <= observed, f'Invalid fail/kill sets for {name}')
         complete = bool(timed) and observed == timed
+        first_complete = complete and not state['uncertain_order']
         failures = len(killed) if mode == 'KILL' else len(failed)
         rate = round(100 * (1 - failures / len(timed)), 4) if complete else None
         other = collections.defaultdict(lambda: {'dies': set(), 'counters': set()})
@@ -250,6 +283,9 @@ def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42'))
         rows.append({'test': name, 'fb': ', '.join(sorted(fbs, key=int)), 'flow_mode': mode,
                      'total_dies': len(dies), 'tested_dies': len(timed), 'observed_dies': len(observed),
                      'counter_only_dies': len(observed - timed), 'counter_fail_dies': len(failed),
+                     'first_scan_fail_dies': len(state['first_failed']) if first_complete else None,
+                     'first_scan_fail_die_indexes': sorted(state['first_failed']) if first_complete else None,
+                     'uncertain_scan_order_dies': len(state['uncertain_order']),
                      'final_kill_dies': len(killed), 'fail_on_final_pass_dies': len(state['final_pass']),
                      'both_pass_fail_dies': len(state['both']), 'yield_percent': rate,
                      'yield_basis': '1 - ' + ('Final Kill Dies' if mode == 'KILL' else 'Counter Fail Dies') + ' / Tested Dies',
@@ -275,7 +311,8 @@ def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42'))
 
 def columns(mode):
     test = [('Test', 'test'), ('TP Flow Mode', 'flow_mode')]
-    population = [('Total Dies', 'total_dies'), ('Tested Dies', 'tested_dies'), ('Counter Fail Dies', 'counter_fail_dies')]
+    population = [('Total Dies', 'total_dies'), ('Tested Dies', 'tested_dies'),
+                  ('Counter Fail Dies', 'counter_fail_dies'), ('First Scan Fail Dies', 'first_scan_fail_dies')]
     kill = ('Final Kill Dies', 'final_kill_dies')
     tail = [('Fail on Final PASS Dies', 'fail_on_final_pass_dies'), ('Observed Fail Counters', 'fail_counters')]
     if mode == 'KILL':
@@ -303,6 +340,8 @@ def write_report(data, output):
     require(report.suffix.lower() == '.html', '--output must end in .html')
     report.parent.mkdir(parents=True, exist_ok=True)
     rows = data['rows']
+    for row in rows:
+        row.setdefault('first_scan_fail_dies', None)
     groups = {mode: [row for row in rows if row['flow_mode'] == mode] for mode in ('KILL', 'EDC')}
     require(sum(map(len, groups.values())) == len(rows), 'Unexpected flow mode in cache')
     for mode, records in groups.items():
@@ -314,7 +353,7 @@ def write_report(data, output):
         ('statistics', '_statistics.csv'), ('kill', '_kill.csv'), ('edc', '_edc.csv'),
         ('overlap', '_overlap.csv'), ('cache', '.json'))}
     audit = ['observed_dies', 'counter_only_dies', 'both_pass_fail_dies', 'yield_basis',
-             'counter_yield_percent', 'declared_fail_counters']
+             'counter_yield_percent', 'declared_fail_counters', 'uncertain_scan_order_dies']
     write_csv(paths['statistics'], [key for label, key in columns('KILL')] + audit, data['rows'])
     for mode, records in groups.items():
         write_csv(paths[mode.lower()], [key for label, key in columns(mode)] + audit, records)
@@ -335,6 +374,8 @@ def write_report(data, output):
                 value = scalar(row[key])
                 if key == 'yield_percent':
                     value = 'N/A' if row[key] is None else f'{row[key]:.2f}%'
+                elif key == 'first_scan_fail_dies' and row[key] is None:
+                    value = 'N/A'
                 elif key == 'fail_counters' and not value:
                     value = 'None observed'
                 cells.append('<td' + (" class='name'" if key == 'test' else '') + '>' + escape(value) + '</td>')
@@ -366,6 +407,12 @@ details{max-width:800px}section{margin-bottom:28px}@media(max-width:600px){body{
     document += '''<p>Lots are combined by exact module::instance, with source lot retained in each die identity.
 Tested Dies counts distinct dies with an exact testtime execution record. Fail counters are deduplicated per die,
 including repeated calls and multiple exits. HRY/SPOFI instances are excluded from item statistics and mapped overlap details.</p>
+<p>First Scan Fail Dies removes dies already failing an earlier retained scan instance in the same module.
+Order follows each die's actual testtime execution sequence, not declaration order or yield sorting.
+All retained scan instances participate, including earlier chain/stuck-at items and both KILL/EDC modes,
+even when the displayed rows are filtered. Modules are independent; HRY/SPOFI do not suppress later items.
+Missing order, incomplete execution evidence, or repeated calls of a failing instance make this count N/A.
+Legacy caches without this metric show N/A and require fresh analysis. Existing yield formulas are unchanged.</p>
 <p>KILL Final Kill Yield = 1 - Final Kill Dies / Tested Dies, sorted ascending.
 EDC Counter Yield = 1 - Counter Fail Dies / Tested Dies, sorted descending. N/A is last in each group.
 Final Kill Dies means the final DB resolves to that exact instance. KILL indicates a regular failure SetBin configuration,

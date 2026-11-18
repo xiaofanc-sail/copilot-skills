@@ -59,6 +59,20 @@ class AnalyzerTests(unittest.TestCase):
         dies, _ = analyzer.load_final_dies(paths, self.tracking(('LOT_A', 'LOT_B')), 'TEST_TP')
         self.assertEqual(len(dies), 2)
 
+    def test_execution_order_preserves_flow_and_repeated_calls(self):
+        path = self.root / 'ordered.ITF'
+        text = self.record().replace('2_tname_testtime_SCN_SAMPLE::CHAIN',
+                                    '2_tname_testtime_SCN_SAMPLE::Z_LAST_ALPHABETICALLY\n'
+                                    '2_tname_testtime_SCN_SAMPLE::CHAIN\n'
+                                    '2_tname_testtime_SCN_SAMPLE::Z_LAST_ALPHABETICALLY')
+        path.write_text(text, encoding='utf-8')
+        record = next(analyzer.read_devices(path))
+        self.assertEqual(record['scan_execution_order'], ['SCN_SAMPLE::Z_LAST_ALPHABETICALLY',
+                                                        'SCN_SAMPLE::CHAIN',
+                                                        'SCN_SAMPLE::Z_LAST_ALPHABETICALLY'])
+        self.assertEqual(record['scan_execution_records'], ['SCN_SAMPLE::CHAIN',
+                                                          'SCN_SAMPLE::Z_LAST_ALPHABETICALLY'])
+
     def test_tracking_mismatch_fails_closed(self):
         path = self.root / 'merged.ITF'
         path.write_text(self.record(), encoding='utf-8')
@@ -110,8 +124,70 @@ class AnalyzerTests(unittest.TestCase):
         names = ['CHAIN', 'CHAIN_RECOVERY', 'COLLECT', 'CLEAN', 'HRY_SAMPLE', 'SPOFI_SAMPLE']
         for die in (first, second):
             die['scan_execution_records'] = ['SCN_SAMPLE::' + name for name in names]
+            die['scan_execution_order'] = list(die['scan_execution_records'])
             die['3_tfail'] = ['41510000', '41520000', '42510000', '42540000', '42550000', '12345678901']
         return [first, second]
+
+    def test_first_scan_fail_dies_follow_each_die_flow_not_yield_order(self):
+        dies = self.sample_dies()
+        dies[1]['scan_execution_order'].reverse()
+        data = analyzer.build_statistics(dies, [], self.tp(), 'TEST_TP')
+        rows = {row['test'].split('::')[1]: row for row in data['rows']}
+        self.assertEqual(rows['CHAIN']['first_scan_fail_dies'], 1)
+        self.assertEqual(rows['CHAIN']['first_scan_fail_die_indexes'], [0])
+        self.assertEqual(rows['CHAIN_RECOVERY']['first_scan_fail_dies'], 0)
+        self.assertEqual(rows['COLLECT']['first_scan_fail_dies'], 1)
+        self.assertEqual(rows['COLLECT']['first_scan_fail_die_indexes'], [1])
+        self.assertEqual(rows['CLEAN']['first_scan_fail_dies'], 0)
+        self.assertIsNone(rows['UNSEEN']['first_scan_fail_dies'])
+        self.assertEqual(rows['CHAIN']['counter_fail_dies'], 2)
+        self.assertEqual(rows['COLLECT']['yield_percent'], 0)
+        result = analyzer.write_report(data, self.root / 'first.html')
+        text = Path(result['report']).read_text(encoding='utf-8')
+        self.assertEqual(text.count('<th>First Scan Fail Dies</th>'), 2)
+        with Path(result['edc']).open(encoding='utf-8-sig', newline='') as source:
+            exported = {row['test'].split('::')[1]: row for row in csv.DictReader(source)}
+        self.assertEqual(exported['COLLECT']['first_scan_fail_dies'], '1')
+        self.assertEqual(exported['UNSEEN']['first_scan_fail_dies'], '')
+
+    def test_first_scan_fail_dies_exclude_hry_spofi_and_other_modules(self):
+        die = {'scan_execution_records': ['SCN_A::HRY_X', 'SCN_A::SPOFI_X', 'SCN_A::PASS',
+                                         'SCN_A::LATE', 'SCN_B::LATE']}
+        die['scan_execution_order'] = list(die['scan_execution_records'])
+        failed = dict.fromkeys(['SCN_A::HRY_X', 'SCN_A::SPOFI_X', 'SCN_A::LATE', 'SCN_B::LATE'])
+        first, uncertain = analyzer.first_scan_failures(die, failed)
+        self.assertEqual(first, {'SCN_A::LATE', 'SCN_B::LATE'})
+        self.assertEqual(uncertain, set())
+
+    def test_first_scan_fail_dies_are_na_for_missing_or_ambiguous_order(self):
+        root = self.tp()
+        for scenario in ('missing_order', 'missing_execution', 'repeated_failure'):
+            with self.subTest(scenario=scenario):
+                dies = self.sample_dies()
+                if scenario == 'missing_order':
+                    dies[0].pop('scan_execution_order')
+                elif scenario == 'missing_execution':
+                    dies[0]['scan_execution_order'].remove('SCN_SAMPLE::CHAIN')
+                    dies[0]['scan_execution_records'].remove('SCN_SAMPLE::CHAIN')
+                else:
+                    dies[0]['scan_execution_order'].append('SCN_SAMPLE::CHAIN')
+                data = analyzer.build_statistics(dies, [], root, 'TEST_TP')
+                collect = next(row for row in data['rows'] if row['test'] == 'SCN_SAMPLE::COLLECT')
+                self.assertIsNone(collect['first_scan_fail_dies'])
+                self.assertIsNone(collect['first_scan_fail_die_indexes'])
+                self.assertEqual(collect['uncertain_scan_order_dies'], 1)
+                self.assertEqual(collect['counter_fail_dies'], 2)
+                self.assertEqual(collect['yield_percent'], 0)
+
+    def test_legacy_cache_first_scan_fail_dies_are_na(self):
+        data = analyzer.build_statistics(self.sample_dies(), [], self.tp(), 'TEST_TP')
+        for row in data['rows']:
+            row.pop('first_scan_fail_dies')
+        result = analyzer.write_report(data, self.root / 'legacy.html')
+        with Path(result['statistics']).open(encoding='utf-8-sig', newline='') as source:
+            self.assertTrue(all(row['first_scan_fail_dies'] == '' for row in csv.DictReader(source)))
+        cached = json.loads(Path(result['cache']).read_text(encoding='utf-8'))
+        self.assertTrue(all(row['first_scan_fail_dies'] is None for row in cached['rows']))
 
     def test_statistics_formulas_and_sort_order(self):
         data = analyzer.build_statistics(self.sample_dies(), [], self.tp(), 'TEST_TP')
@@ -179,8 +255,12 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual([row['yield_percent'] for row in rows], ['100.0', '0.0', ''])
         cached = json.loads(Path(result['cache']).read_text(encoding='utf-8'))
         second = self.root / 'second.html'
-        analyzer.write_report(cached, second)
+        rendered = analyzer.write_report(cached, second)
         self.assertTrue(second.exists())
+        self.assertEqual([row['first_scan_fail_dies'] for row in cached['rows']], [2, 0, 0, 0, None])
+        self.assertEqual(cached['evidence'][0]['scan_execution_order'],
+                 self.sample_dies()[0]['scan_execution_order'])
+        self.assertEqual(Path(rendered['statistics']).read_bytes(), Path(result['statistics']).read_bytes())
 
     def test_cli_analysis_and_render(self):
         root = self.tp()
