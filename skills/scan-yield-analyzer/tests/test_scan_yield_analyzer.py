@@ -27,7 +27,7 @@ class AnalyzerTests(unittest.TestCase):
                 f'3_tfail_{{{db},{db}}}\n3_tpass_{{}}\n'
                 '2_tname_testtime_SCN_SAMPLE::CHAIN\n3_lend\n')
 
-    def tracking(self, lots=('LOT_A',), fb='4151'):
+    def tracking(self, lots=('LOT_A',), fb='4151', ib='41', db='41510000'):
         path = self.root / 'tracking.csv'
         fields = ['Lot', 'Operation', 'Within_LATO_Latest_Flag', 'Substructure_ID', 'Sort_Wafer_ID',
                   'Sort_X_Location', 'Sort_Y_Location', 'Functional_Bin', 'Interface_Bin', 'Data_Bin']
@@ -35,7 +35,7 @@ class AnalyzerTests(unittest.TestCase):
             writer = csv.DictWriter(target, fieldnames=fields)
             writer.writeheader()
             for lot in lots:
-                writer.writerow(dict(zip(fields, [lot, '100', 'Y', 'UNIT', '1', '2', '3', fb, '41', '41510000'])))
+                writer.writerow(dict(zip(fields, [lot, '100', 'Y', 'UNIT', '1', '2', '3', fb, ib, db])))
         return path
 
     def test_concatenated_gzip_and_retest(self):
@@ -49,6 +49,16 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(len(dies), 1)
         self.assertEqual(dies[0]['3_dvtsteddt'], '20260101010000')
         self.assertEqual(validation[0]['raw_records'], 2)
+
+    def test_counter_sets_allow_padding_and_empty_whitespace(self):
+        path = self.root / 'padded.ITF'
+        text = self.record().replace('3_tfail_{41510000,41510000}', '3_tfail_{ 41510000, 41510000 }')
+        path.write_text(text.replace('3_tpass_{}', '3_tpass_{  }'), encoding='utf-8')
+        record = next(analyzer.read_devices(path))
+        self.assertEqual(record['3_tfail'], ['41510000'])
+        self.assertEqual(record['3_tpass'], [])
+        path.write_text(text.replace('3_tfail_{ 41510000, 41510000 }', '3_tfail_{  }'), encoding='utf-8')
+        self.assertEqual(next(analyzer.read_devices(path))['3_tfail'], [])
 
     def test_lot_is_part_of_die_identity(self):
         paths = []
@@ -78,6 +88,22 @@ class AnalyzerTests(unittest.TestCase):
         path.write_text(self.record(), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'Functional_Bin'):
             analyzer.load_final_dies([path], self.tracking(fb='9999'), 'TEST_TP')
+
+    def test_missing_db_requires_matching_empty_tracking_db(self):
+        path = self.root / 'empty_db.ITF'
+        text = self.record(fb='9321', ib='93').replace('3_binn_41510000\n', '')
+        path.write_text(text.replace('3_tfail_{41510000,41510000}', '3_tfail_{  }'), encoding='utf-8')
+        dies, _ = analyzer.load_final_dies([path], self.tracking(fb='9321', ib='93', db=''), 'TEST_TP')
+        self.assertEqual(len(dies), 1)
+        self.assertEqual(dies[0]['3_binn'], '')
+        with self.assertRaisesRegex(ValueError, 'Data_Bin'):
+            analyzer.load_final_dies([path], self.tracking(fb='9321', ib='93'), 'TEST_TP')
+
+    def test_scan_ib_still_requires_final_db(self):
+        dies = self.sample_dies()
+        dies[0]['3_binn'] = ''
+        with self.assertRaisesRegex(ValueError, 'Scan IB has no matching final DB'):
+            analyzer.build_statistics(dies, [], self.tp(), 'TEST_TP')
 
     def test_tp_mismatch_fails_closed(self):
         path = self.root / 'merged.ITF'
@@ -200,6 +226,58 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(kill[1]['fb'], '4151')
         self.assertEqual(data['summary']['total_dies'], 2)
         self.assertEqual(data['summary']['final_scan_kill_dies'], 1)
+
+    def test_fail_on_final_pass_dies_deduplicate_without_alias_column(self):
+        dies = self.sample_dies()
+        dies[1]['3_curibin'] = '5'
+        dies[1]['3_trslt'] = 'pAsS'
+        dies[1]['3_tfail'] = dies[1]['3_tfail'] + ['42510000', '42510000']
+        dies.append({**dies[1], '6_lotid': 'LOT_C', '3_trslt': 'Fail'})
+        data = analyzer.build_statistics(dies, [], self.tp(), 'TEST_TP')
+        rows = {row['test'].split('::')[1]: row for row in data['rows']}
+        for name in ('CHAIN', 'CHAIN_RECOVERY', 'COLLECT'):
+            self.assertEqual(rows[name]['counter_fail_dies'], 3)
+            self.assertNotIn('good_die_counter_fail_dies', rows[name])
+            self.assertEqual(rows[name]['fail_on_final_pass_dies'], 1)
+        self.assertEqual(rows['COLLECT']['first_scan_fail_dies'], 0)
+        self.assertEqual(rows['COLLECT']['yield_percent'], 0)
+        self.assertEqual(rows['CLEAN']['fail_on_final_pass_dies'], 0)
+        self.assertEqual(rows['UNSEEN']['fail_on_final_pass_dies'], 0)
+        result = analyzer.write_report(data, self.root / 'good.html')
+        text = Path(result['report']).read_text(encoding='utf-8')
+        self.assertEqual(text.count('<th>Fail on Final PASS Dies</th>'), 2)
+        self.assertNotIn('Good Die Counter Fail Dies', text)
+        for mode in ('kill', 'edc', 'statistics'):
+            with Path(result[mode]).open(encoding='utf-8-sig', newline='') as source:
+                reader = csv.DictReader(source)
+                self.assertEqual(reader.fieldnames.count('fail_on_final_pass_dies'), 1)
+                self.assertNotIn('good_die_counter_fail_dies', reader.fieldnames)
+                exported = list(reader)
+            self.assertTrue(exported)
+            self.assertTrue(all(int(row['fail_on_final_pass_dies']) ==
+                                rows[row['test'].split('::')[1]]['fail_on_final_pass_dies'] for row in exported))
+        cached = json.loads(Path(result['cache']).read_text(encoding='utf-8'))
+        rendered = analyzer.write_report(cached, self.root / 'good_cached.html')
+        self.assertEqual(Path(result['statistics']).read_bytes(), Path(rendered['statistics']).read_bytes())
+
+    def test_fail_on_final_pass_dies_migrates_alias_cache_and_handles_missing_metric(self):
+        data = analyzer.build_statistics(self.sample_dies(), [], self.tp(), 'TEST_TP')
+        expected = {row['test']: row['fail_on_final_pass_dies'] for row in data['rows']}
+        for row in data['rows']:
+            row['good_die_counter_fail_dies'] = row.pop('fail_on_final_pass_dies')
+        data['rows'][0].pop('good_die_counter_fail_dies')
+        data['rows'][1]['fail_on_final_pass_dies'] = expected[data['rows'][1]['test']]
+        data['rows'][1]['good_die_counter_fail_dies'] = 999
+        result = analyzer.write_report(data, self.root / 'legacy_good.html')
+        self.assertIsNone(data['rows'][0]['fail_on_final_pass_dies'])
+        for row in data['rows'][1:]:
+            self.assertEqual(row['fail_on_final_pass_dies'], expected[row['test']])
+        self.assertTrue(all('good_die_counter_fail_dies' not in row for row in data['rows']))
+        with Path(result['statistics']).open(encoding='utf-8-sig', newline='') as source:
+            self.assertEqual(next(csv.DictReader(source))['fail_on_final_pass_dies'], '')
+        cached = json.loads(Path(result['cache']).read_text(encoding='utf-8'))
+        self.assertTrue(all('good_die_counter_fail_dies' not in row for row in cached['rows']))
+        self.assertIn('<td>N/A</td>', Path(result['report']).read_text(encoding='utf-8'))
 
     def test_exclusion_and_unknown_overlap_counters(self):
         data = analyzer.build_statistics(self.sample_dies(), [], self.tp(), 'TEST_TP')

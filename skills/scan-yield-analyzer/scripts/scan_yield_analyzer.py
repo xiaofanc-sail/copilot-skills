@@ -39,7 +39,7 @@ def read_devices(path):
                 device = {**header, 'scan_execution_records': set(), 'scan_execution_order': []} if line == '3_lsep' else None
             elif device is not None:
                 if tag in {'3_tfail', '3_tpass'}:
-                    require(re.fullmatch(r'\{(?:\d+(?:\s*,\s*\d+)*)?\}', value),
+                    require(re.fullmatch(r'\{\s*(?:\d+(?:\s*,\s*\d+)*)?\s*\}', value),
                             f'Invalid {tag} in {path}: {value}')
                     counters = [counter.strip() for counter in value[1:-1].split(',') if counter.strip()]
                     device[tag] = sorted(set(device.get(tag, [])) | set(counters), key=int)
@@ -77,7 +77,7 @@ def load_final_dies(paths, tracking_path, program):
         for record in read_devices(path):
             found = True
             needed = {'6_lotid', '6_prgnm', '5_lcode', '4_wafid', '3_wafxloc', '3_wafyloc',
-                      '3_dvtsteddt', '3_binn', '3_curfbin', '3_curibin', '3_trslt'}
+                      '3_dvtsteddt', '3_curfbin', '3_curibin', '3_trslt'}
             require(needed <= record.keys(), f'Missing die fields in {path}: {sorted(needed - record.keys())}')
             require(record['6_prgnm'] == program, f'TP mismatch in {path}; analyze different TPs separately')
             lot = record['6_lotid']
@@ -109,7 +109,8 @@ def load_final_dies(paths, tracking_path, program):
         record = latest[key]
         for raw_key, csv_key in (('5_lcode', 'Operation'), ('3_curfbin', 'Functional_Bin'),
                                  ('3_curibin', 'Interface_Bin'), ('3_binn', 'Data_Bin')):
-            require(record[raw_key] == row[csv_key], f'Tracking mismatch for {key}: {csv_key}')
+            require(record.get(raw_key, '') == row[csv_key], f'Tracking mismatch for {key}: {csv_key}')
+        record.setdefault('3_binn', '')
         validated.append(record)
     require(identities == latest.keys() and bool(identities), 'Tracking and iTUFF final die populations differ')
     validation = [{'lot': lot, 'operation': operation, 'raw_records': counts[lot],
@@ -312,9 +313,10 @@ def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42'))
 def columns(mode):
     test = [('Test', 'test'), ('TP Flow Mode', 'flow_mode')]
     population = [('Total Dies', 'total_dies'), ('Tested Dies', 'tested_dies'),
-                  ('Counter Fail Dies', 'counter_fail_dies'), ('First Scan Fail Dies', 'first_scan_fail_dies')]
+                  ('Counter Fail Dies', 'counter_fail_dies'), ('First Scan Fail Dies', 'first_scan_fail_dies'),
+                  ('Fail on Final PASS Dies', 'fail_on_final_pass_dies')]
     kill = ('Final Kill Dies', 'final_kill_dies')
-    tail = [('Fail on Final PASS Dies', 'fail_on_final_pass_dies'), ('Observed Fail Counters', 'fail_counters')]
+    tail = [('Observed Fail Counters', 'fail_counters')]
     if mode == 'KILL':
         return [('FB', 'fb')] + test + [kill, ('Final Kill Yield', 'yield_percent')] + population + tail
     return test + population + [('Counter Yield', 'yield_percent'), kill] + tail
@@ -342,6 +344,8 @@ def write_report(data, output):
     rows = data['rows']
     for row in rows:
         row.setdefault('first_scan_fail_dies', None)
+        previous_alias = row.pop('good_die_counter_fail_dies', None)
+        row.setdefault('fail_on_final_pass_dies', previous_alias)
     groups = {mode: [row for row in rows if row['flow_mode'] == mode] for mode in ('KILL', 'EDC')}
     require(sum(map(len, groups.values())) == len(rows), 'Unexpected flow mode in cache')
     for mode, records in groups.items():
@@ -374,7 +378,7 @@ def write_report(data, output):
                 value = scalar(row[key])
                 if key == 'yield_percent':
                     value = 'N/A' if row[key] is None else f'{row[key]:.2f}%'
-                elif key == 'first_scan_fail_dies' and row[key] is None:
+                elif key in {'first_scan_fail_dies', 'fail_on_final_pass_dies'} and row[key] is None:
                     value = 'N/A'
                 elif key == 'fail_counters' and not value:
                     value = 'None observed'
@@ -407,6 +411,10 @@ details{max-width:800px}section{margin-bottom:28px}@media(max-width:600px){body{
     document += '''<p>Lots are combined by exact module::instance, with source lot retained in each die identity.
 Tested Dies counts distinct dies with an exact testtime execution record. Fail counters are deduplicated per die,
 including repeated calls and multiple exits. HRY/SPOFI instances are excluded from item statistics and mapped overlap details.</p>
+<p>Fail on Final PASS Dies counts distinct final PASS dies with a fail counter for this exact instance,
+regardless of final IB number. It is a subset of Counter Fail Dies, without removing earlier scan failures.
+Repeated fail counters count once per die; final non-PASS dies are excluded even if this instance did not kill them.
+It does not change Tested Dies, First Scan Fail Dies or either yield formula.</p>
 <p>First Scan Fail Dies removes dies already failing an earlier retained scan instance in the same module.
 Order follows each die's actual testtime execution sequence, not declaration order or yield sorting.
 All retained scan instances participate, including earlier chain/stuck-at items and both KILL/EDC modes,
