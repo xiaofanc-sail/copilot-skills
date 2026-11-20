@@ -215,6 +215,53 @@ class AnalyzerTests(unittest.TestCase):
         cached = json.loads(Path(result['cache']).read_text(encoding='utf-8'))
         self.assertTrue(all(row['first_scan_fail_dies'] is None for row in cached['rows']))
 
+    def test_kill_locations_use_final_attribution_and_preserve_die_identity(self):
+        dies = self.sample_dies()
+        dies[0]['3_wafxloc'] = '-2'
+        dies.append({**dies[0], '6_lotid': 'LOT_C'})
+        dies.append({**dies[0], '4_wafid': '2'})
+        data = analyzer.build_statistics(dies, [], self.tp(), 'TEST_TP')
+        rows = {row['test'].split('::')[1]: row for row in data['rows']}
+        locations = rows['CHAIN']['final_kill_locations']
+        self.assertEqual(len(locations), rows['CHAIN']['final_kill_dies'])
+        self.assertEqual([(item['lot'], item['wafer'], item['x'], item['y']) for item in locations],
+                         [('LOT_A', '1', '-2', '3'), ('LOT_C', '1', '-2', '3'), ('LOT_A', '2', '-2', '3')])
+        self.assertEqual(locations[0]['final_db'], '41510000')
+        self.assertEqual(locations[0]['final_fb'], '4151')
+        self.assertEqual(locations[0]['final_ib'], '41')
+        self.assertEqual(rows['CHAIN_RECOVERY']['final_kill_locations'], [])
+        self.assertNotIn('final_kill_locations', rows['COLLECT'])
+        result = analyzer.write_report(data, self.root / 'locations.html')
+        with Path(result['kill_locations']).open(encoding='utf-8-sig', newline='') as source:
+            exported = list(csv.DictReader(source))
+        self.assertEqual(len(exported), 3)
+        self.assertTrue(all(item['test'] == 'SCN_SAMPLE::CHAIN' and item['flow_mode'] == 'KILL'
+                            for item in exported))
+        self.assertEqual([{key: item[key] for key in locations[0]} for item in exported], locations)
+        text = Path(result['report']).read_text(encoding='utf-8')
+        self.assertEqual(text.count('<th>Final Kill Die Locations</th>'), 1)
+        self.assertIn('<summary>3 final kill dies</summary>', text)
+        cached = json.loads(Path(result['cache']).read_text(encoding='utf-8'))
+        self.assertEqual(cached['rows'][0]['final_kill_locations'], locations)
+        for row in cached['rows']:
+            row.pop('final_kill_locations', None)
+        rendered = analyzer.write_report(cached, self.root / 'legacy_locations.html')
+        self.assertEqual(Path(result['kill_locations']).read_bytes(), Path(rendered['kill_locations']).read_bytes())
+
+    def test_kill_locations_reject_missing_or_duplicate_evidence(self):
+        root = self.tp()
+        for scenario in ('missing_die', 'missing_coordinate', 'duplicate_die'):
+            with self.subTest(scenario=scenario):
+                data = analyzer.build_statistics(self.sample_dies(), [], root, 'TEST_TP')
+                if scenario == 'missing_die':
+                    data['evidence'].pop(0)
+                elif scenario == 'missing_coordinate':
+                    data['evidence'][0].pop('x')
+                else:
+                    data['evidence'].append(dict(data['evidence'][0]))
+                with self.assertRaisesRegex(ValueError, 'location'):
+                    analyzer.write_report(data, self.root / 'invalid.html')
+
     def test_statistics_formulas_and_sort_order(self):
         data = analyzer.build_statistics(self.sample_dies(), [], self.tp(), 'TEST_TP')
         kill = [row for row in data['rows'] if row['flow_mode'] == 'KILL']

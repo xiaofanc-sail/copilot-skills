@@ -306,8 +306,32 @@ def build_statistics(dies, validation, tp_root, program, scan_bins=('41', '42'))
                'dies_with_nonkill_scan_failures': len({index for row in rows for index in row['nonkill_die_indexes']}),
                'final_scan_kill_dies': sum(row['final_kill_dies'] for row in rows),
                'scan_ib_fail_dies': sum(die['3_curibin'] in scan_bins for die in dies)}
-    return {'schema_version': 1, 'program': program, 'scan_bins': list(scan_bins), 'validation': validation,
+    data = {'schema_version': 1, 'program': program, 'scan_bins': list(scan_bins), 'validation': validation,
             'summary': summary, 'rows': rows, 'evidence': evidence}
+    collect_kill_locations(data)
+    return data
+
+
+def collect_kill_locations(data):
+    locations = collections.defaultdict(list)
+    kill_names = {row['test'] for row in data['rows'] if row['flow_mode'] == 'KILL'}
+    fields = ('lot', 'wafer', 'x', 'y', 'final_ib', 'final_fb', 'final_db')
+    identities = set()
+    for die in data.get('evidence', []):
+        name = die.get('primary_test')
+        if name not in kill_names:
+            continue
+        require(all(die.get(field) is not None and str(die[field]) != '' for field in fields),
+                f'Incomplete final kill location evidence for {name}; rerun analysis')
+        identity = tuple(str(die[field]) for field in fields[:4])
+        require(identity not in identities, f'Duplicate final kill die location: {identity}')
+        identities.add(identity)
+        locations[name].append({field: die[field] for field in fields})
+    for row in data['rows']:
+        if row['flow_mode'] == 'KILL':
+            require(len(locations[row['test']]) == row['final_kill_dies'],
+                    f'Final kill location count mismatch for {row["test"]}; rerun analysis')
+            row['final_kill_locations'] = locations[row['test']]
 
 
 def columns(mode):
@@ -338,6 +362,7 @@ def write_csv(path, fields, records):
 
 def write_report(data, output):
     require(data.get('schema_version') == 1, 'Unsupported statistics cache schema')
+    collect_kill_locations(data)
     report = Path(output)
     require(report.suffix.lower() == '.html', '--output must end in .html')
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -355,12 +380,16 @@ def write_report(data, output):
     require(not any(excluded(row['test']) for row in rows), 'Excluded instance in statistics cache')
     paths = {name: report.with_name(report.stem + suffix) for name, suffix in (
         ('statistics', '_statistics.csv'), ('kill', '_kill.csv'), ('edc', '_edc.csv'),
-        ('overlap', '_overlap.csv'), ('cache', '.json'))}
+        ('kill_locations', '_kill_locations.csv'), ('overlap', '_overlap.csv'), ('cache', '.json'))}
     audit = ['observed_dies', 'counter_only_dies', 'both_pass_fail_dies', 'yield_basis',
              'counter_yield_percent', 'declared_fail_counters', 'uncertain_scan_order_dies']
     write_csv(paths['statistics'], [key for label, key in columns('KILL')] + audit, data['rows'])
     for mode, records in groups.items():
         write_csv(paths[mode.lower()], [key for label, key in columns(mode)] + audit, records)
+    location_fields = ['lot', 'wafer', 'x', 'y', 'final_ib', 'final_fb', 'final_db']
+    kill_locations = [{'test': row['test'], 'flow_mode': row['flow_mode'], **location}
+                      for row in groups['KILL'] for location in row['final_kill_locations']]
+    write_csv(paths['kill_locations'], ['test', 'flow_mode'] + location_fields, kill_locations)
     overlap = [{'scan_test': row['test'], 'flow_mode': row['flow_mode'],
                 'final_kill_dies': row['final_kill_dies'], **other}
                for row in data['rows'] for other in row['other_failures']]
@@ -383,6 +412,18 @@ def write_report(data, output):
                 elif key == 'fail_counters' and not value:
                     value = 'None observed'
                 cells.append('<td' + (" class='name'" if key == 'test' else '') + '>' + escape(value) + '</td>')
+            if mode == 'KILL':
+                locations = row['final_kill_locations']
+                location_detail = 'None'
+                if locations:
+                    location_rows = ''.join('<tr>' + ''.join('<td>' + escape(str(location[field])) + '</td>'
+                                                           for field in location_fields) + '</tr>'
+                                            for location in locations)
+                    location_detail = ('<details><summary>' + str(len(locations)) + ' final kill dies</summary>'
+                                       + '<div class="scroll"><table><thead><tr><th>Lot</th><th>Wafer</th>'
+                                       + '<th>X</th><th>Y</th><th>Final IB</th><th>Final FB</th><th>Final DB</th>'
+                                       + '</tr></thead><tbody>' + location_rows + '</tbody></table></div></details>')
+                cells.append('<td>' + location_detail + '</td>')
             others = row['other_failures']
             detail = 'N/A'
             if others:
@@ -394,6 +435,8 @@ def write_report(data, output):
                           + '<th>Fail counters</th></tr>' + detail_rows + '</table></div></details>')
             body.append('<tr>' + ''.join(cells) + '<td>' + detail + '</td></tr>')
         header = ''.join('<th>' + escape(label) + '</th>' for label, key in fields)
+        if mode == 'KILL':
+            header += '<th>Final Kill Die Locations</th>'
         return ('<div class="scroll"><table><thead><tr>' + header + '<th>Other Fail Tests / Counters</th></tr></thead>'
                 + '<tbody>' + ''.join(body) + '</tbody></table></div>')
 
@@ -431,6 +474,7 @@ Failures overlap across tests and must not be added as lot yield loss. Unknown c
 their instance type cannot be checked for HRY/SPOFI exclusion.</p>'''
     document += '<p>' + ' | '.join('<a download href="' + escape(path.name, quote=True) + '">' + escape(name)
                                   + '</a>' for name, path in (('All statistics CSV', paths['statistics']),
+                                                             ('Final kill locations CSV', paths['kill_locations']),
                                                              ('Other-failure CSV', paths['overlap']))) + '</p>'
     summary_columns = [('Total Dies', 'total_dies'), ('Observed Scan Tests', 'observed_scan_tests'),
                        ('Failing Tests With Zero Final Kills', 'failing_tests_with_zero_final_kills'),

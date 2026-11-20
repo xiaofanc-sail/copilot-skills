@@ -1,6 +1,6 @@
 ---
 name: scan-yield-analyzer
-description: 'Analyze lot-level scan yield from AQUA tracking, raw iTUFF and TP MTPL/bin definitions. Use when users ask to analyze or compare scan yield for one or more lots, investigate scan IB 41/42, list FB/test names, find non-killing scan failures or overlapping fail counters, or generate/update separate KILL and EDC yield reports. Supports combined lots, actual tested-die denominators, final-kill yield, counter yield, and HRY/SPOFI exclusion. Not for single-unit CLASS failure analysis.'
+description: 'Analyze lot-level scan yield from AQUA tracking, raw iTUFF and TP MTPL/bin definitions. Use when users ask to analyze or compare scan yield for one or more lots, investigate scan IB 41/42, list FB/test names, collect KILL instance die locations, find non-killing scan failures or overlapping fail counters, or generate/update separate KILL and EDC yield reports. Supports combined lots, actual tested-die denominators, final-kill yield, counter yield, and HRY/SPOFI exclusion. Not for single-unit CLASS failure analysis.'
 ---
 
 # Scan Yield Analyzer
@@ -20,6 +20,8 @@ Run the bundled [Python script](./scripts/scan_yield_analyzer.py) to create a st
 - Display `Fail on Final PASS Dies` (`fail_on_final_pass_dies`) after `First Scan Fail Dies` in both tables. Count distinct dies in the intersection of this instance's counter-failure set and final PASS dies (`3_trslt`, case-insensitive), regardless of final IB number. Exclude final non-PASS dies even when the instance did not kill them. Do not subtract earlier scan failures or change any yield formula or denominator.
 - Keep only `fail_on_final_pass_dies` for this metric in HTML/CSV/JSON; do not add a duplicate good-die counter-failure column. Repeated failures count once per die; no observed failures in good dies means zero, not a good-die yield estimate.
 - Separate KILL and EDC tables. Preserve zero-final-kill items and zero-counter-failure items in their proper TP group.
+- Collect `final_kill_locations` for each KILL instance from final dies whose exact `primary_test` matches that instance, not from all counter failures. Retain `lot`, `wafer`, `x`, `y`, `final_ib`, `final_fb` and `final_db`; preserve signed coordinates and distinct lot/wafer identities. The location count must equal `final_kill_dies`. Zero-kill instances have an empty list, including unexecuted KILL instances. Do not add this field to EDC rows or change existing counts or yields.
+- Show expandable Final Kill Die Locations in the HTML KILL table and export one record per final killed die in a separate `_kill_locations.csv`. Keep the initial KILL columns and EDC layout unchanged. Reject duplicate or incomplete location evidence and count mismatches rather than guessing locations.
 - KILL yield is `100 * (1 - Final Kill Dies / Tested Dies)`, sorted ascending.
 - EDC yield is `100 * (1 - Counter Fail Dies / Tested Dies)`, sorted descending.
 - Put N/A last in both groups. Unexecuted tests and incomplete execution evidence are N/A, not 100%.
@@ -76,6 +78,7 @@ Check the command exit code and JSON console output. Confirm:
 5. Final Kill Dies is a final DB attribution, not a synonym for counter failures. Overlapping failures must not be summed as lot yield loss.
 6. First Scan Fail Dies is no greater than Counter Fail Dies and subtracts failures in earlier included scan items of the same module, even when those items are hidden by an atspeed-only display filter. Confirm the new column in HTML, KILL/EDC CSV and JSON; retain N/A when ordering evidence is insufficient.
 7. Fail on Final PASS Dies equals the number of `failed_die_indexes` whose evidence has `final_result=PASS` (case-insensitive), and never exceeds Counter Fail Dies. Check both table groups and exports; verify that original yields and First Scan Fail Dies are unchanged.
+8. Each KILL row's `final_kill_locations` matches the evidence whose `primary_test` equals that exact instance, and its length equals `final_kill_dies`. Check lot/wafer/X/Y and final bins against evidence, HTML details and the location CSV. Counter-only failures and failures finally attributed to another instance must not appear. Same coordinates on different lots or wafers remain separate dies.
 
 Open the generated local HTML using the system browser, such as `Start-Process -FilePath $reportPath`. If the integrated browser rejects a non-trusted local folder, use the system browser; do not change trust settings or claim visual verification without access. No web server is needed.
 
@@ -93,6 +96,8 @@ Older caches without `first_scan_fail_dies` render the new column as N/A. Fresh 
 
 Older caches containing `good_die_counter_fail_dies` can be re-rendered directly: retain `fail_on_final_pass_dies` when present, otherwise migrate the alias value to it, then remove the alias from the output cache. If neither field exists, show N/A (null in JSON, blank in CSV), not zero. No raw-log rereading is needed when either saved value is present.
 
+Final kill locations are rebuilt from saved per-die evidence during rendering, including for older caches without `final_kill_locations`. No raw-log rereading is needed when the cache retains exact primary-instance attribution and location/bin fields. Missing evidence, duplicate die identities or a location count differing from `final_kill_dies` stops rendering and requires fresh analysis; do not infer locations from FB alone or from `failed_die_indexes`.
+
 ## Artifacts
 
 For an output named `scan.html`, the script writes:
@@ -102,6 +107,7 @@ For an output named `scan.html`, the script writes:
 | `scan.html` | Separate observed KILL/EDC tables and expandable other-failure details |
 | `scan_statistics.csv` | All retained tests, including unexecuted tests and yield basis |
 | `scan_kill.csv` | KILL rows, FB first, final-kill yield ascending |
+| `scan_kill_locations.csv` | One row per KILL instance's final killed die: test, flow_mode, lot, wafer, x, y, final_ib, final_fb, final_db |
 | `scan_edc.csv` | EDC rows, counter yield descending, unexecuted rows last |
 | `scan_overlap.csv` | Per-test other-failure names/counters and affected-die counts |
 | `scan.json` | Re-renderable statistics and per-die evidence; failed-die indexes reference its evidence array |
@@ -111,6 +117,8 @@ Counter Fail Dies and Final Kill Dies are distinct. Do not add the redundant "Fa
 `first_scan_fail_dies` is an additional count, not a replacement yield. JSON retains `scan_execution_order` per die and `first_scan_fail_die_indexes` per item for audit. `uncertain_scan_order_dies` counts observed dies whose same-module first-failure attribution is uncertain. N/A counts are null in JSON, blank in CSV and shown as N/A in HTML.
 
 `fail_on_final_pass_dies` is a count restricted to final good dies, not a percentage. Audit it using `failed_die_indexes` and per-die `final_result`. Unexecuted items have zero observed good-die failures, while their yield remains N/A.
+
+`final_kill_locations` is a structured list on KILL JSON rows. HTML shows the list in expandable details; the separate location CSV is flat for coordinate filtering and downstream wafer analysis. Zero-kill instances produce no location CSV records, while their original summary rows remain present. Existing KILL/EDC summary CSV schemas and all yield definitions are unchanged.
 
 ## Interpretation and Limits
 
